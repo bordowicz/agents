@@ -1,0 +1,24 @@
+{
+  "strategy_name": "Crypto_Ultimate_Alpha_v2",
+  "version": "2.0.0",
+  "scan_settings": {
+    "top_n_volume": 100,
+    "timeframe": "5m",
+    "limit_candles": 150
+  },
+  "indicators": {
+    "rsi_period": 14,
+    "atr_period": 14,
+    "ema_fast": 20,
+    "ema_slow": 50,
+    "vsa_volume_multiplier": 2.5,
+    "bb_period": 20,
+    "bb_std": 2.0,
+    "bb_squeeze_threshold": 0.015,
+    "swing_lookback": 50
+  },
+  "maturation": {
+    "required_signals": 2,
+    "lookback_minutes": 30
+  }
+}
