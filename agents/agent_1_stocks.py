@@ -63,9 +63,9 @@ def calculate_indicators(df: pd.DataFrame, config: dict) -> pd.DataFrame:
     # MACD
     macd = ta.macd(df['Close'], fast=ind_cfg['macd_fast'], slow=ind_cfg['macd_slow'], signal=ind_cfg['macd_signal'])
     if macd is not None and not macd.empty:
-        df['macd'] = macd.filter(like='MACD_').iloc[:, 0]
-        df['macdh'] = macd.filter(like='MACDH_').iloc[:, 0]
-        df['macds'] = macd.filter(like='MACDS_').iloc[:, 0]
+        df['macd'] = macd.iloc[:, 0]
+        df['macdh'] = macd.iloc[:, 1]
+        df['macds'] = macd.iloc[:, 2]
     else:
         df['macd'] = pd.NA
         df['macdh'] = pd.NA
@@ -74,9 +74,9 @@ def calculate_indicators(df: pd.DataFrame, config: dict) -> pd.DataFrame:
     # ADX
     adx = ta.adx(df['High'], df['Low'], df['Close'], length=ind_cfg['adx_period'])
     if adx is not None and not adx.empty:
-        df['adx'] = adx.filter(like='ADX_').iloc[:, 0]
-        df['dmp'] = adx.filter(like='DMP_').iloc[:, 0]
-        df['dmn'] = adx.filter(like='DMN_').iloc[:, 0]
+        df['adx'] = adx.iloc[:, 0]
+        df['dmp'] = adx.iloc[:, 1]
+        df['dmn'] = adx.iloc[:, 2]
     else:
         df['adx'] = pd.NA
         df['dmp'] = pd.NA
@@ -85,8 +85,8 @@ def calculate_indicators(df: pd.DataFrame, config: dict) -> pd.DataFrame:
     # Stochastic
     stoch = ta.stoch(df['High'], df['Low'], df['Close'], k=ind_cfg['stoch_k'], d=ind_cfg['stoch_d'])
     if stoch is not None and not stoch.empty:
-        df['stoch_k'] = stoch.filter(like='STOCHk_').iloc[:, 0]
-        df['stoch_d'] = stoch.filter(like='STOCHd_').iloc[:, 0]
+        df['stoch_k'] = stoch.iloc[:, 0]
+        df['stoch_d'] = stoch.iloc[:, 1]
     else:
         df['stoch_k'] = pd.NA
         df['stoch_d'] = pd.NA

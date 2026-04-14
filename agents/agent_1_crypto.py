@@ -67,9 +67,9 @@ def calculate_ultimate_indicators(df: pd.DataFrame, config: dict) -> pd.DataFram
 
     macd = ta.macd(df['c'], fast=ind_cfg['macd_fast'], slow=ind_cfg['macd_slow'], signal=ind_cfg['macd_signal'])
     if macd is not None and not macd.empty:
-        df['macd'] = macd.filter(like='MACD_').iloc[:, 0]
-        df['macdh'] = macd.filter(like='MACDH_').iloc[:, 0]
-        df['macds'] = macd.filter(like='MACDS_').iloc[:, 0]
+        df['macd'] = macd.iloc[:, 0]
+        df['macdh'] = macd.iloc[:, 1]
+        df['macds'] = macd.iloc[:, 2]
     else:
         df['macd'] = pd.NA
         df['macdh'] = pd.NA
@@ -77,9 +77,9 @@ def calculate_ultimate_indicators(df: pd.DataFrame, config: dict) -> pd.DataFram
 
     adx = ta.adx(df['h'], df['l'], df['c'], length=ind_cfg['adx_period'])
     if adx is not None and not adx.empty:
-        df['adx'] = adx.filter(like='ADX_').iloc[:, 0]
-        df['dmp'] = adx.filter(like='DMP_').iloc[:, 0]
-        df['dmn'] = adx.filter(like='DMN_').iloc[:, 0]
+        df['adx'] = adx.iloc[:, 0]
+        df['dmp'] = adx.iloc[:, 1]
+        df['dmn'] = adx.iloc[:, 2]
     else:
         df['adx'] = pd.NA
         df['dmp'] = pd.NA
@@ -87,9 +87,9 @@ def calculate_ultimate_indicators(df: pd.DataFrame, config: dict) -> pd.DataFram
 
     bb = ta.bbands(df['c'], length=ind_cfg['bb_period'], std=ind_cfg['bb_std'])
     if bb is not None and not bb.empty:
-        df['bb_lower'] = bb.filter(like='BBL').iloc[:, 0]
-        df['bb_mid']   = bb.filter(like='BBM').iloc[:, 0]
-        df['bb_upper'] = bb.filter(like='BBU').iloc[:, 0]
+        df['bb_lower'] = bb.iloc[:, 0]
+        df['bb_mid']   = bb.iloc[:, 1]
+        df['bb_upper'] = bb.iloc[:, 2]
         df['bb_width'] = (df['bb_upper'] - df['bb_lower']) / df['bb_mid']
         df['is_squeeze'] = df['bb_width'] < ind_cfg['bb_squeeze_threshold']
     else:
