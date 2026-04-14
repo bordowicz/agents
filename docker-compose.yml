@@ -1,0 +1,46 @@
+services:
+  openclaw:
+    image: ghcr.io/openclaw/openclaw:latest
+    container_name: openclaw
+    restart: always
+    ports:
+      - "18789:18789"
+    volumes:
+      - ./config:/home/node/.openclaw
+    environment:
+      - OPENCLAW_AUTH_TOKEN=MojeHaslo2026!
+      # Te flagi w wersji 2026 wymuszają luźniejsze podejście do bezpieczeństwa:
+      - OPENCLAW_BIND=0.0.0.0
+      - OPENCLAW_ALLOWED_ORIGINS=*
+      - NODE_ENV=production
+
+  trading_db:
+    image: timescale/timescaledb:latest-pg15
+    container_name: trading_db
+    restart: always
+    environment:
+      - POSTGRES_PASSWORD=TwojeSilneHaslo123
+    volumes:
+      - ./postgres_data:/var/lib/postgresql/data
+    networks:
+      - openclaw_network
+
+  trading_worker:
+    build: .
+    container_name: trading_worker
+    volumes:
+      - /home/ubuntu/openclaw/workspace:/app
+    environment:
+      - DATABASE_URL=postgresql://postgres:TwojeSilneHaslo123@trading_db:5432/postgres
+      - TELEGRAM_SIGNAL_TOKEN=8303211300:AAFS-I4XHSG7HZCPHHbItwm2xRDYVaCDnIU
+      - CHAT_ID=7527753442
+      - ANTHROPIC_API_KEY=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
+    working_dir: /app
+    command: tail -f /dev/null # Utrzymuje kontener włączony
+    networks:
+      - openclaw_network
+
+networks:
+  openclaw_network:
+    driver: bridge
+
