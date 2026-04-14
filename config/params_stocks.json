@@ -2,7 +2,18 @@
   "strategy_name": "Stocks_Ultimate_Alpha_v3",
   "version": "3.0.0",
   "scan_settings": {
-    "active_tickers": ["AAPL", "TSLA", "MSFT", "NVDA", "GOOGL", "AMZN", "META", "BRK-B"],
+    "active_tickers": [
+      "AAPL", "MSFT", "GOOGL", "AMZN", "META", "TSLA", "NVDA", "ORCL", "COHR", "TTD", "TYL", "ADBE", "IBM", "SAP", "NOW", "CRM", "ODD", "AMD", "COIN", "PLTR", "SNOW", "MSTR", "NET", "DDOG", "ZS", "PANW", "FTNT", "CRWD", "OKTA",
+      "AVGO", "TSM", "ASML", "ARM", "QCOM", "AMAT", "LRCX", "KLAC", "MU", "INTC", "TXN", "ADI", "NXPI", "MRVL",
+      "LLY", "NVO", "UNH", "JNJ", "ABBV", "MRK", "VRTX", "ISRG", "AMGN", "GILD", "REGN", "MDT", "PFE", "BNTX", "MRNA",
+      "V", "MA", "PYPL", "SQ", "AXP", "BLK", "BX", "KKR", "APO", "JPM", "BAC", "WFC", "C", "GS", "MS", "USB", "PNC", "TFC", "BK", "COF", "SCHW",
+      "XOM", "CVX", "SHEL", "TTE", "BP", "COP", "EOG", "OXY", "SLB", "HAL",
+      "CAT", "DE", "HON", "GE", "LMT", "RTX", "BA", "UPS", "FDX", "UNP", "MMM",
+      "WMT", "COST", "MCD", "NKE", "SBUX", "HD", "LOW", "KO", "PEP", "PG", "EL", "DIS", "NFLX", "UBER", "ABNB", "BKNG",
+      "ORL.WA", "PKO.WA", "PEO.WA", "PZU.WA", "DNP.WA", "KGH.WA", "LPP.WA", "ALE.WA", "CDR.WA", "SPL.WA", "ALR.WA", "MBK.WA", "JSW.WA", "PGE.WA", "TPE.WA", "ACP.WA", "OPL.WA", "CPS.WA", "GPW.WA", "SGN.WA", "KRU.WA", "CLN.WA", "COG.WA", "NWG.WA", "CBF.WA", "MBR.WA", "SNT.WA", "SPR.WA", "11B.WA", "TEN.WA", "RVU.WA", "PLW.WA", "ENA.WA", "MIL.WA", "ATT.WA", "BDX.WA", "XTB.WA",
+      "GC=F", "SI=F", "PL=F", "PA=F", "HG=F", "CL=F", "NG=F", "ZC=F", "ZS=F", "ZW=F", "KC=F", "CC=F", "CT=F", "LB=F",
+      "URA", "SILJ", "GDX", "XME", "LIT", "TAN", "XLE", "XLF", "XLK", "XLV", "XLI", "XBI", "SMH", "SOXX", "ARKK", "KWEB", "FXI", "TLT", "HYG", "SPY", "QQQ", "IWM", "VIX"
+    ],
     "timeframe": "1h",
     "limit_candles": 200
   },
