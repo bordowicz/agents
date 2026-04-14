@@ -1,16 +1,21 @@
 {
-  "strategy_name": "Crypto_Ultimate_Alpha_v2",
-  "version": "2.0.0",
+  "strategy_name": "Crypto_Ultimate_Alpha_v3",
+  "version": "3.0.0",
   "scan_settings": {
     "top_n_volume": 100,
     "timeframe": "5m",
-    "limit_candles": 150
+    "limit_candles": 200
   },
   "indicators": {
     "rsi_period": 14,
     "atr_period": 14,
     "ema_fast": 20,
     "ema_slow": 50,
+    "macd_fast": 12,
+    "macd_slow": 26,
+    "macd_signal": 9,
+    "adx_period": 14,
+    "adx_threshold": 25,
     "vsa_volume_multiplier": 2.5,
     "bb_period": 20,
     "bb_std": 2.0,

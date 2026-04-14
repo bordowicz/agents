@@ -12,160 +12,143 @@ logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s
 logger = logging.getLogger("AI_Analyst_Agent")
 
 # ENV
-DB_URL = os.getenv("DATABASE_URL")
-TG_TOKEN = os.getenv("TELEGRAM_SIGNAL_TOKEN")
-CHAT_ID = os.getenv("CHAT_ID")
-ANTHROPIC_KEY = os.getenv("ANTHROPIC_API_KEY")
+DB_URL: str = os.getenv("DATABASE_URL", "")
+TG_TOKEN: str = os.getenv("TELEGRAM_SIGNAL_TOKEN", "")
+CHAT_ID: str = os.getenv("CHAT_ID", "")
+ANTHROPIC_KEY: str = os.getenv("ANTHROPIC_API_KEY", "")
 
 engine = create_engine(DB_URL)
 client = Anthropic(api_key=ANTHROPIC_KEY)
 
-async def send_tg(message):
+async def send_tg(message: str) -> None:
     if not TG_TOKEN or not CHAT_ID: return
     try:
         bot = telegram.Bot(token=TG_TOKEN)
-        await bot.send_message(chat_id=CHAT_ID, text=message, parse_mode='Markdown')
+        await bot.send_message(chat_id=CHAT_ID, text=message, parse_mode='HTML')
     except Exception as e:
         logger.error(f"Telegram Error: {e}")
 
 def get_pending_setups():
-    """Znajduje symbole, które miały Ultimate Setup w ciągu ostatnich 30 min, ale nie zostały jeszcze przeanalizowane."""
+    """Znajduje symbole z ostatnimi setupami do analizy."""
     query = text("""
         WITH RecentSetups AS (
-            SELECT symbol, MAX(time) as setup_time
+            SELECT symbol, MAX(time) as setup_time, market_type
             FROM price_history
-            WHERE market_type = 'crypto'
-              AND (indicators->>'vsa_signal')::boolean = true
+            WHERE (indicators->>'vsa_signal')::boolean = true
               AND time > NOW() - INTERVAL '30 minutes'
-            GROUP BY symbol
+            GROUP BY symbol, market_type
         )
-        SELECT r.symbol
+        SELECT r.symbol, r.market_type
         FROM RecentSetups r
         LEFT JOIN signals s ON r.symbol = s.symbol AND s.created_at > NOW() - INTERVAL '4 hours'
-        WHERE s.id IS NULL; -- Wykluczamy te, które już były analizowane ostatnio
+        WHERE s.id IS NULL;
     """)
     with engine.connect() as conn:
         result = conn.execute(query).fetchall()
-        return [row[0] for row in result]
+        return [(row[0], row[1]) for row in result]
 
-def get_market_context(symbol):
-    """Pobiera ostatnie 20 świec dla AI, by mogło ocenić strukturę ceny."""
+def get_market_context(symbol: str) -> pd.DataFrame:
     query = text("""
         SELECT time, price, volume, indicators
         FROM price_history
         WHERE symbol = :sym
-        ORDER BY time DESC LIMIT 20
+        ORDER BY time DESC LIMIT 30
     """)
     with engine.connect() as conn:
         df = pd.read_sql(query, conn, params={"sym": symbol})
-
-    # Sortujemy od najstarszej do najnowszej dla LLM
     df = df.sort_values(by='time')
     return df
 
-def ask_claude_for_setup(symbol, df_context):
-    """Wysyła dane do Claude  Sonnet i wymusza odpowiedź w JSON."""
-
-    # Formatujemy dane do czytelnego stringa dla AI
+def ask_claude_for_setup(symbol: str, df_context: pd.DataFrame) -> dict | None:
     context_str = ""
     for _, row in df_context.iterrows():
-        ind = row['indicators'] # dict, bo wczytane przez pandas/sqlalchemy z JSONB
-        if isinstance(ind, str): ind = json.loads(ind) # Zabezpieczenie
+        ind = row['indicators']
+        if isinstance(ind, str): ind = json.loads(ind)
+        context_str += (
+            f"T: {row['time']}, P: {row['price']}, V: {row['volume']}, "
+            f"VWAP: {ind.get('vwap', 0):.4f}, RSI: {ind.get('rsi', 0):.1f}, "
+            f"MACD: {ind.get('macd', 0):.4f}, ADX: {ind.get('adx', 0):.1f}, "
+            f"EMA_F/S: {ind.get('ema_fast', 0):.2f}/{ind.get('ema_slow', 0):.2f}\n"
+        )
 
-        context_str += f"Cena: {row['price']}, Vol: {row['volume']}, VWAP: {ind.get('vwap', 0):.4f}, RSI: {ind.get('rsi', 0)}, BB_Squeeze: {ind.get('is_squeeze', False)}\n"
+    system_prompt = """You are an elite Quant Trader. Analyze 30 periods of data for an asset with a VSA anomaly.
+    Task: Validate if this is a high-probability LONG or SHORT entry.
 
-    system_prompt = """You are an elite Quant Trader and Risk Manager.
-    Analyze the provided 5-minute interval crypto data (last 20 periods) for an asset that just triggered a Volume Spread Analysis (VSA) anomaly during a Bollinger Squeeze, above VWAP.
+    CRITERIA FOR LONG: Price consistently above/bouncing off VWAP, EMA Fast > Slow, MACD bullish, RSI > 45.
+    CRITERIA FOR SHORT: Price consistently below VWAP, EMA Fast < Slow, MACD bearish, RSI < 55.
 
-    Your task:
-    1. Determine if this is a valid LONG entry. (If false breakout, return status 'REJECTED').
-    2. If valid, provide exact prices for: Entry, Stop Loss (SL), and Take Profit (TP).
-    3. Ensure Risk/Reward ratio is at least 1:2. SL must be placed below recent structure or VWAP.
+    If valid, provide Entry, SL, and TP. RR ratio must be at least 1:2.
+    SL for LONG: Below recent swing low or VWAP.
+    SL for SHORT: Above recent swing high or VWAP.
 
-    You MUST respond ONLY with a raw JSON object in the exact format below. No markdown formatting, no explanations outside JSON.
+    You MUST respond ONLY with a raw JSON object:
     {
       "status": "APPROVED" | "REJECTED",
+      "direction": "LONG" | "SHORT",
       "entry": float,
       "sl": float,
       "tp": float,
-      "reasoning": "string (max 3 sentences)"
+      "reasoning": "string (max 2 sentences, explain why LONG or SHORT based on VWAP and trend)"
     }"""
 
-    user_prompt = f"Analyze the following recent price action for {symbol}:\n\n{context_str}"
+    user_prompt = f"Analyze {symbol}:\n\n{context_str}"
 
     try:
         response = client.messages.create(
-            model="claude-sonnet-4-6",
-            max_tokens=300,
-            temperature=0.2, # Niski temperature dla analitycznej precyzji
+            model="claude-3-5-sonnet-20241022",
+            max_tokens=500,
+            temperature=0.1,
             system=system_prompt,
-            messages=[
-                {"role": "user", "content": user_prompt}
-            ]
+            messages=[{"role": "user", "content": user_prompt}]
         )
-
-        # Ekstrakcja czystego JSONa z odpowiedzi
         result_text = response.content[0].text.strip()
-
-        # Jeśli AI doda bloki kodu pomimo zakazu, usuwamy je
         if result_text.startswith("```json"):
             result_text = result_text.replace("```json\n", "").replace("\n```", "")
-
         return json.loads(result_text)
     except Exception as e:
         logger.error(f"Błąd API Claude dla {symbol}: {e}")
         return None
 
 async def main():
-    if not ANTHROPIC_KEY:
-        logger.error("Brak klucza ANTHROPIC_API_KEY. Zakończenie pracy.")
-        return
+    if not ANTHROPIC_KEY: return
+    setups = get_pending_setups()
+    if not setups: return
 
-    symbols_to_analyze = get_pending_setups()
-    if not symbols_to_analyze:
-        logger.info("Brak nowych sygnałów Ultimate Setup do analizy.")
-        return
-
-    logger.info(f"Znaleziono {len(symbols_to_analyze)} potencjalnych sygnałów. Rozpoczynam analizę AI...")
-
-    for symbol in symbols_to_analyze:
+    for symbol, m_type in setups:
         df_context = get_market_context(symbol)
         if df_context.empty: continue
 
-        logger.info(f"Odpytuję Claude 4.6 Sonnet dla {symbol}...")
         ai_verdict = ask_claude_for_setup(symbol, df_context)
-
         if not ai_verdict: continue
 
-        # Zapis do bazy danych
         with engine.connect() as conn:
             query = text("""
-                INSERT INTO signals (symbol, entry_price, sl, tp, ai_verdict, status)
-                VALUES (:sym, :en, :sl, :tp, :verdict, :status)
+                INSERT INTO signals (symbol, entry_price, sl, tp, ai_verdict, status, direction, market_type)
+                VALUES (:sym, :en, :sl, :tp, :verdict, :status, :dir, :mt)
             """)
             conn.execute(query, {
-                "sym": symbol,
-                "en": ai_verdict.get('entry', 0.0),
-                "sl": ai_verdict.get('sl', 0.0),
-                "tp": ai_verdict.get('tp', 0.0),
+                "sym": symbol, "en": ai_verdict.get('entry', 0.0),
+                "sl": ai_verdict.get('sl', 0.0), "tp": ai_verdict.get('tp', 0.0),
                 "verdict": ai_verdict.get('reasoning', ''),
-                "status": "OPEN" if ai_verdict.get('status') == 'APPROVED' else "REJECTED"
+                "status": "OPEN" if ai_verdict.get('status') == 'APPROVED' else "REJECTED",
+                "dir": ai_verdict.get('direction', 'LONG'),
+                "mt": m_type
             })
             conn.commit()
 
-        # Powiadomienie Telegram, jeśli AI zatwierdziło sygnał
         if ai_verdict.get('status') == 'APPROVED':
+            dir_icon = "🚀" if ai_verdict['direction'] == "LONG" else "📉"
+            dir_text = "WZROST (LONG)" if ai_verdict['direction'] == "LONG" else "SPADEK (SHORT)"
+
             msg = (
-                f"🧠 *AI TRADE APPROVED*: {symbol}\n\n"
-                f"🎯 *Entry:* `{ai_verdict['entry']}`\n"
-                f"🛑 *Stop Loss:* `{ai_verdict['sl']}`\n"
-                f"✅ *Take Profit:* `{ai_verdict['tp']}`\n\n"
-                f"📝 *AI Reasoning:*\n_{ai_verdict['reasoning']}_"
+                f"🧠 <b>AI ZATWIERDZA TRANSAKCJĘ: {symbol}</b>\n\n"
+                f"🎯 <b>Kierunek:</b> <u>{dir_text}</u> {dir_icon}\n"
+                f"💰 <b>Wejście:</b> <code>{ai_verdict['entry']}</code>\n"
+                f"🛑 <b>Stop Loss:</b> <code>{ai_verdict['sl']}</code>\n"
+                f"✅ <b>Take Profit:</b> <code>{ai_verdict['tp']}</code>\n\n"
+                f"📝 <b>Analiza ekspercka:</b>\n<i>{ai_verdict['reasoning']}</i>"
             )
             await send_tg(msg)
-            logger.info(f"Wysłano zatwierdzony sygnał dla {symbol}")
-        else:
-            logger.info(f"AI odrzuciło sygnał dla {symbol}. Powód: {ai_verdict.get('reasoning')}")
 
 if __name__ == "__main__":
     asyncio.run(main())
