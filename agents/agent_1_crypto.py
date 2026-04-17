@@ -103,14 +103,10 @@ def calculate_ultimate_indicators(df: pd.DataFrame, config: dict) -> pd.DataFram
     df['swing_low'] = df['l'].rolling(window=ind_cfg['swing_lookback']).min()
 
     # Obliczamy kandydatów na SL i TP (Hybryda: Struktura + ATR)
-    # Dla Long: SL to minimum z (dołek lub vwap) minus pół ATRa
     df['hybrid_sl_long'] = df[['swing_low', 'vwap']].min(axis=1) - (0.5 * df['atr'])
-    # Dla Long: TP to szczyt minus 0.2 ATRa
     df['hybrid_tp_long'] = df['swing_high'] - (0.2 * df['atr'])
 
-    # Dla Short: SL to maksimum z (szczyt lub vwap) plus pół ATRa
     df['hybrid_sl_short'] = df[['swing_high', 'vwap']].max(axis=1) + (0.5 * df['atr'])
-    # Dla Short: TP to dołek plus 0.2 ATRa
     df['hybrid_tp_short'] = df['swing_low'] + (0.2 * df['atr'])
 
     avg_vol = df['v'].rolling(window=20).mean()
@@ -188,7 +184,6 @@ async def scan_market() -> None:
                 "swing_h": float(last['swing_high']),
                 "swing_l": float(last['swing_low']),
                 "rsi_slope": float(last['rsi_slope']) if not pd.isna(last['rsi_slope']) else 0.0,
-                # Dodajemy nasze hybrydowe wyliczenia
                 "sl_hybrid_long": float(last['hybrid_sl_long']),
                 "tp_hybrid_long": float(last['hybrid_tp_long']),
                 "sl_hybrid_short": float(last['hybrid_sl_short']),
@@ -229,6 +224,12 @@ async def scan_market() -> None:
                 sl_val, tp_val, rr_ratio = 0.0, 0.0, 0.0
 
                 if vsa_count >= mat_cfg['required_signals']:
+
+                    # Wczytanie konfiguracji ryzyka raz dla obu kierunków
+                    risk_cfg: dict = config.get('risk_management', {'min_rr_ratio': 2.0, 'manual_alert_rr_ratio': 1.5})
+                    MIN_RR = risk_cfg['min_rr_ratio']
+                    MANUAL_RR = risk_cfg['manual_alert_rr_ratio']
+
                     # WERYFIKACJA LONG
                     if price_above_vwap and last['ema_fast'] > last['ema_slow'] and last['macd'] > last['macds']:
                         direction = "LONG"
@@ -238,14 +239,10 @@ async def scan_market() -> None:
                         reward = tp_val - float(current_price)
                         rr_ratio = reward / risk if risk > 0 else 0
 
-                        risk_cfg: dict = config.get('risk_management', {'min_rr_ratio': 2.0, 'manual_alert_rr_ratio': 1.5})
-                            MIN_RR = risk_cfg['min_rr_ratio']
-                            MANUAL_RR = risk_cfg['manual_alert_rr_ratio']
-
                         if rr_ratio >= MIN_RR:
-                                setup_detected = True
-                            elif rr_ratio >= MANUAL_RR:
-                                manual_alert = True
+                            setup_detected = True
+                        elif rr_ratio >= MANUAL_RR:
+                            manual_alert = True
 
                     # WERYFIKACJA SHORT
                     elif price_below_vwap and last['ema_fast'] < last['ema_slow'] and last['macd'] < last['macds']:
@@ -256,16 +253,12 @@ async def scan_market() -> None:
                         reward = float(current_price) - tp_val
                         rr_ratio = reward / risk if risk > 0 else 0
 
-                        risk_cfg: dict = config.get('risk_management', {'min_rr_ratio': 2.0, 'manual_alert_rr_ratio': 1.5})
-                        MIN_RR = risk_cfg['min_rr_ratio']
-                        MANUAL_RR = risk_cfg['manual_alert_rr_ratio']
-
                         if rr_ratio >= MIN_RR:
                             setup_detected = True
                         elif rr_ratio >= MANUAL_RR:
                             manual_alert = True
 
-                # SCIEŻKA 1: Idealny Setup (RR >= 2.0) -> idzie do AI
+                # SCIEŻKA 1: Idealny Setup (RR >= MIN_RR) -> idzie do AI
                 if setup_detected:
                     icon = "📈" if direction == "LONG" else "📉"
                     msg = (
@@ -283,7 +276,7 @@ async def scan_market() -> None:
                     await send_tg_topic(msg)
                     logger.info(f"Wykryto setup {direction} dla {symbol} (RR: {rr_ratio:.2f})")
 
-                # SCIEŻKA 2: Manualny Setup (1.5 <= RR < 2.0) -> ignorowany przez AI
+                # SCIEŻKA 2: Manualny Setup (MANUAL_RR <= RR < MIN_RR) -> ignorowany przez AI
                 elif manual_alert:
                     icon = "👀"
                     msg = (

@@ -188,6 +188,11 @@ async def scan_market() -> None:
                 if vsa_count >= mat_cfg['required_signals']:
                     curr_price_f = safe_float(last_row['Close'])
 
+                    # Wczytanie konfiguracji ryzyka raz dla obu kierunków
+                    risk_cfg: dict = config.get('risk_management', {'min_rr_ratio': 2.0, 'manual_alert_rr_ratio': 1.5})
+                    MIN_RR = risk_cfg['min_rr_ratio']
+                    MANUAL_RR = risk_cfg['manual_alert_rr_ratio']
+
                     # WERYFIKACJA LONG
                     if price_above_vwap and safe_float(last_row['ema_fast']) > safe_float(last_row['ema_slow']):
                         direction = "LONG"
@@ -196,10 +201,6 @@ async def scan_market() -> None:
                         risk = curr_price_f - sl_val
                         reward = tp_val - curr_price_f
                         rr_ratio = reward / risk if risk > 0 else 0
-
-                        risk_cfg: dict = config.get('risk_management', {'min_rr_ratio': 2.0, 'manual_alert_rr_ratio': 1.5})
-                        MIN_RR = risk_cfg['min_rr_ratio']
-                        MANUAL_RR = risk_cfg['manual_alert_rr_ratio']
 
                         if rr_ratio >= MIN_RR:
                             setup_detected = True
@@ -215,16 +216,12 @@ async def scan_market() -> None:
                         reward = curr_price_f - tp_val
                         rr_ratio = reward / risk if risk > 0 else 0
 
-                        risk_cfg: dict = config.get('risk_management', {'min_rr_ratio': 2.0, 'manual_alert_rr_ratio': 1.5})
-                        MIN_RR = risk_cfg['min_rr_ratio']
-                        MANUAL_RR = risk_cfg['manual_alert_rr_ratio']
-
                         if rr_ratio >= MIN_RR:
                             setup_detected = True
                         elif rr_ratio >= MANUAL_RR:
                             manual_alert = True
 
-                # SCIEŻKA 1: Setup dla AI (RR >= 2.0)
+                # SCIEŻKA 1: Setup dla AI (RR >= MIN_RR)
                 if setup_detected:
                     icon = "📈" if direction == "LONG" else "📉"
                     msg = (
@@ -242,7 +239,7 @@ async def scan_market() -> None:
                     await send_tg_topic(msg)
                     logger.info(f"Wykryto setup {direction} dla {symbol} (RR: {rr_ratio:.2f})")
 
-                # SCIEŻKA 2: Setup manualny (1.5 <= RR < 2.0)
+                # SCIEŻKA 2: Setup manualny (MANUAL_RR <= RR < MIN_RR)
                 elif manual_alert:
                     icon = "👀"
                     msg = (
