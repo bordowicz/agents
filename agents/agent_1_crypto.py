@@ -4,7 +4,7 @@ import ccxt
 import pandas as pd
 import pandas_ta as ta
 from sqlalchemy import create_engine, text
-import telegram
+import requests
 import asyncio
 import logging
 from decimal import Decimal
@@ -22,7 +22,8 @@ STABLECOINS = {
 # ENV
 DB_URL: str = os.getenv("DATABASE_URL", "")
 TG_TOKEN: str = os.getenv("TELEGRAM_SIGNAL_TOKEN", "")
-CHAT_ID: str = os.getenv("CHAT_ID", "")
+CHAT_ID: str = os.getenv("GROUP_CHAT_ID", "")
+THREAD_ID: str = os.getenv("SCANNER_THREAD_CRYPTO_ID", "10")
 
 engine = create_engine(DB_URL)
 BASE_DIR: str = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -37,18 +38,26 @@ def load_config() -> dict:
         exit(1)
 
 def is_stable_pair(symbol: str) -> bool:
-    """Zwraca True, jeśli oba aktywa w parze są stablecoinami."""
     try:
         base, quote = symbol.split('/')
         return base in STABLECOINS and quote in STABLECOINS
     except Exception:
         return False
 
-async def send_tg(message: str) -> None:
+async def send_tg_topic(message: str) -> None:
     if not TG_TOKEN or not CHAT_ID: return
+    url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": CHAT_ID,
+        "text": message,
+        "parse_mode": "HTML"
+    }
+    if THREAD_ID:
+        payload["message_thread_id"] = int(THREAD_ID)
+
     try:
-        bot = telegram.Bot(token=TG_TOKEN)
-        await bot.send_message(chat_id=CHAT_ID, text=message, parse_mode='HTML') # Zmiana na HTML dla lepszej czytelności
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, lambda: requests.post(url, json=payload, timeout=10))
     except Exception as e:
         logger.error(f"Telegram Error: {e}")
 
@@ -71,42 +80,43 @@ def calculate_ultimate_indicators(df: pd.DataFrame, config: dict) -> pd.DataFram
         df['macdh'] = macd.iloc[:, 1]
         df['macds'] = macd.iloc[:, 2]
     else:
-        df['macd'] = pd.NA
-        df['macdh'] = pd.NA
-        df['macds'] = pd.NA
+        df['macd'] = pd.NA; df['macdh'] = pd.NA; df['macds'] = pd.NA
 
     adx = ta.adx(df['h'], df['l'], df['c'], length=ind_cfg['adx_period'])
     if adx is not None and not adx.empty:
-        df['adx'] = adx.iloc[:, 0]
-        df['dmp'] = adx.iloc[:, 1]
-        df['dmn'] = adx.iloc[:, 2]
+        df['adx'] = adx.iloc[:, 0]; df['dmp'] = adx.iloc[:, 1]; df['dmn'] = adx.iloc[:, 2]
     else:
-        df['adx'] = pd.NA
-        df['dmp'] = pd.NA
-        df['dmn'] = pd.NA
+        df['adx'] = pd.NA; df['dmp'] = pd.NA; df['dmn'] = pd.NA
 
     bb = ta.bbands(df['c'], length=ind_cfg['bb_period'], std=ind_cfg['bb_std'])
     if bb is not None and not bb.empty:
-        df['bb_lower'] = bb.iloc[:, 0]
-        df['bb_mid']   = bb.iloc[:, 1]
-        df['bb_upper'] = bb.iloc[:, 2]
+        df['bb_lower'] = bb.iloc[:, 0]; df['bb_mid'] = bb.iloc[:, 1]; df['bb_upper'] = bb.iloc[:, 2]
         df['bb_width'] = (df['bb_upper'] - df['bb_lower']) / df['bb_mid']
         df['is_squeeze'] = df['bb_width'] < ind_cfg['bb_squeeze_threshold']
     else:
-        df['is_squeeze'] = False
-        df['bb_lower'] = pd.NA
-        df['bb_mid'] = pd.NA
-        df['bb_upper'] = pd.NA
-        df['bb_width'] = pd.NA
+        df['is_squeeze'] = False; df['bb_lower'] = pd.NA; df['bb_mid'] = pd.NA; df['bb_upper'] = pd.NA; df['bb_width'] = pd.NA
 
     df = calculate_vwap(df)
+
+    # --- LOGIKA HYBRYDOWYCH POZIOMÓW ---
+    df['swing_high'] = df['h'].rolling(window=ind_cfg['swing_lookback']).max()
+    df['swing_low'] = df['l'].rolling(window=ind_cfg['swing_lookback']).min()
+
+    # Obliczamy kandydatów na SL i TP (Hybryda: Struktura + ATR)
+    # Dla Long: SL to minimum z (dołek lub vwap) minus pół ATRa
+    df['hybrid_sl_long'] = df[['swing_low', 'vwap']].min(axis=1) - (0.5 * df['atr'])
+    # Dla Long: TP to szczyt minus 0.2 ATRa
+    df['hybrid_tp_long'] = df['swing_high'] - (0.2 * df['atr'])
+
+    # Dla Short: SL to maksimum z (szczyt lub vwap) plus pół ATRa
+    df['hybrid_sl_short'] = df[['swing_high', 'vwap']].max(axis=1) + (0.5 * df['atr'])
+    # Dla Short: TP to dołek plus 0.2 ATRa
+    df['hybrid_tp_short'] = df['swing_low'] + (0.2 * df['atr'])
+
     avg_vol = df['v'].rolling(window=20).mean()
     vol_spike = df['v'] > (avg_vol * ind_cfg['vsa_volume_multiplier'])
     spread = df['h'] - df['l']
-    narrow_spread = spread < spread.rolling(window=20).mean()
-    df['is_big_guy'] = vol_spike & narrow_spread
-    df['swing_high'] = df['h'].rolling(window=ind_cfg['swing_lookback']).max()
-    df['swing_low'] = df['l'].rolling(window=ind_cfg['swing_lookback']).min()
+    df['is_big_guy'] = vol_spike & (spread < spread.rolling(window=20).mean())
     df['rsi_slope'] = df['rsi'].diff(3)
 
     return df
@@ -160,6 +170,7 @@ async def scan_market() -> None:
             if pd.isna(last['rsi']) or pd.isna(last['vwap']) or pd.isna(last['macd']) or pd.isna(last['adx']):
                 continue
 
+            # --- PRZYGOTOWANIE WSKAŹNIKÓW DO BAZY ---
             indicators_json = {
                 "rsi": float(last['rsi']),
                 "atr": float(last['atr']),
@@ -176,7 +187,12 @@ async def scan_market() -> None:
                 "vsa_signal": bool(last['is_big_guy']),
                 "swing_h": float(last['swing_high']),
                 "swing_l": float(last['swing_low']),
-                "rsi_slope": float(last['rsi_slope']) if not pd.isna(last['rsi_slope']) else 0.0
+                "rsi_slope": float(last['rsi_slope']) if not pd.isna(last['rsi_slope']) else 0.0,
+                # Dodajemy nasze hybrydowe wyliczenia
+                "sl_hybrid_long": float(last['hybrid_sl_long']),
+                "tp_hybrid_long": float(last['hybrid_tp_long']),
+                "sl_hybrid_short": float(last['hybrid_sl_short']),
+                "tp_hybrid_short": float(last['hybrid_tp_short'])
             }
 
             current_price: Decimal = Decimal(str(last['c']))
@@ -206,53 +222,86 @@ async def scan_market() -> None:
                 price_above_vwap: bool = (recent_candles['c'] >= recent_candles['vwap']).all()
                 price_below_vwap: bool = (recent_candles['c'] <= recent_candles['vwap']).all()
 
-                # --- LOGIKA LONG ---
-                long_bullish_ema: bool = last['ema_fast'] > last['ema_slow']
-                long_macd_bullish: bool = last['macd'] > last['macds'] and last['macdh'] > 0
-                long_adx_strong: bool = last['adx'] > ind_cfg['adx_threshold'] and last['dmp'] > last['dmn']
-                long_rsi_healthy: bool = last['rsi'] > 45 and last['rsi_slope'] >= -1.0
-
-                # --- LOGIKA SHORT ---
-                short_bearish_ema: bool = last['ema_fast'] < last['ema_slow']
-                short_macd_bearish: bool = last['macd'] < last['macds'] and last['macdh'] < 0
-                short_adx_strong: bool = last['adx'] > ind_cfg['adx_threshold'] and last['dmn'] > last['dmp']
-                short_rsi_weak: bool = last['rsi'] < 55 and last['rsi_slope'] <= 1.0
-
+                # --- NOWOŚĆ: Obliczanie RR na brzegu i 2 rodzaje alertów ---
                 setup_detected = False
+                manual_alert = False
                 direction = ""
-                reasoning = ""
+                sl_val, tp_val, rr_ratio = 0.0, 0.0, 0.0
 
                 if vsa_count >= mat_cfg['required_signals']:
-                    if price_above_vwap and long_bullish_ema and long_macd_bullish and long_adx_strong and long_rsi_healthy:
-                        setup_detected = True
+                    # WERYFIKACJA LONG
+                    if price_above_vwap and last['ema_fast'] > last['ema_slow'] and last['macd'] > last['macds']:
                         direction = "LONG"
-                        reasoning = "Wzrostowy (Cena nad VWAP, Trend Bullish)"
-                    elif price_below_vwap and short_bearish_ema and short_macd_bearish and short_adx_strong and short_rsi_weak:
-                        setup_detected = True
+                        sl_val = float(last['hybrid_sl_long'])
+                        tp_val = float(last['hybrid_tp_long'])
+                        risk = float(current_price) - sl_val
+                        reward = tp_val - float(current_price)
+                        rr_ratio = reward / risk if risk > 0 else 0
+
+                        risk_cfg: dict = config.get('risk_management', {'min_rr_ratio': 2.0, 'manual_alert_rr_ratio': 1.5})
+                            MIN_RR = risk_cfg['min_rr_ratio']
+                            MANUAL_RR = risk_cfg['manual_alert_rr_ratio']
+
+                        if rr_ratio >= MIN_RR:
+                                setup_detected = True
+                            elif rr_ratio >= MANUAL_RR:
+                                manual_alert = True
+
+                    # WERYFIKACJA SHORT
+                    elif price_below_vwap and last['ema_fast'] < last['ema_slow'] and last['macd'] < last['macds']:
                         direction = "SHORT"
-                        reasoning = "Spadkowy (Cena pod VWAP, Trend Bearish)"
+                        sl_val = float(last['hybrid_sl_short'])
+                        tp_val = float(last['hybrid_tp_short'])
+                        risk = sl_val - float(current_price)
+                        reward = float(current_price) - tp_val
+                        rr_ratio = reward / risk if risk > 0 else 0
 
+                        risk_cfg: dict = config.get('risk_management', {'min_rr_ratio': 2.0, 'manual_alert_rr_ratio': 1.5})
+                        MIN_RR = risk_cfg['min_rr_ratio']
+                        MANUAL_RR = risk_cfg['manual_alert_rr_ratio']
+
+                        if rr_ratio >= MIN_RR:
+                            setup_detected = True
+                        elif rr_ratio >= MANUAL_RR:
+                            manual_alert = True
+
+                # SCIEŻKA 1: Idealny Setup (RR >= 2.0) -> idzie do AI
                 if setup_detected:
-                    direction_icon = "📈" if direction == "LONG" else "📉"
-                    direction_text = "WZROST" if direction == "LONG" else "SPADEK"
-
+                    icon = "📈" if direction == "LONG" else "📉"
                     msg = (
-                        f"{direction_icon} <b>POTENCJALNY {direction_text} (Setup {direction}): {symbol}</b>\n\n"
-                        f"🚀 <b>Dlaczego?</b>\n"
-                        f"• Trend: <u>{reasoning}</u>\n"
-                        f"• Aktywność Dużych Graczy (VSA): Tak ({vsa_count}x)\n"
-                        f"• Siła Trendu (ADX): {float(last['adx']):.1f} (Silny)\n\n"
-                        f"📊 <b>Dane techniczne:</b>\n"
+                        f"{icon} <b>DETEKCJA SETUPU (CRYPTO): {symbol}</b>\n\n"
+                        f"🚀 <b>Typ:</b> {direction}\n"
+                        f"• VSA Signals: {vsa_count}x\n\n"
+                        f"📊 <b>Dane:</b>\n"
                         f"• Cena: <code>{current_price}</code>\n"
                         f"• RSI: <code>{float(last['rsi']):.1f}</code>\n"
-                        f"• Bollinger Squeeze: <code>{'TAK' if last['is_squeeze'] else 'NIE'}</code>\n\n"
-                        f"⏳ <i>Przekazuję dane do eksperta AI w celu wyznaczenia SL/TP...</i>"
+                        f"• Hybrydowy SL: <code>{sl_val:.6f}</code>\n"
+                        f"• Hybrydowy TP: <code>{tp_val:.6f}</code>\n"
+                        f"⚖️ <b>Risk/Reward:</b> <code>1:{rr_ratio:.2f}</code>\n\n"
+                        f"⏳ <i>Przekazuję dane do analizy AI...</i>"
                     )
-                    await send_tg(msg)
-                    logger.info(f"Wykryto setup {direction} dla {symbol}")
+                    await send_tg_topic(msg)
+                    logger.info(f"Wykryto setup {direction} dla {symbol} (RR: {rr_ratio:.2f})")
+
+                # SCIEŻKA 2: Manualny Setup (1.5 <= RR < 2.0) -> ignorowany przez AI
+                elif manual_alert:
+                    icon = "👀"
+                    msg = (
+                        f"{icon} <b>OBSERWACJA RĘCZNA (CRYPTO): {symbol}</b>\n\n"
+                        f"🚀 <b>Typ:</b> {direction}\n"
+                        f"• VSA Signals: {vsa_count}x\n\n"
+                        f"📊 <b>Dane:</b>\n"
+                        f"• Cena: <code>{current_price}</code>\n"
+                        f"• Hybrydowy SL: <code>{sl_val:.6f}</code>\n"
+                        f"• Hybrydowy TP: <code>{tp_val:.6f}</code>\n"
+                        f"⚖️ <b>Risk/Reward:</b> <code>1:{rr_ratio:.2f}</code>\n\n"
+                        f"⛔ <i>RR zbyt niskie dla AI. Trade do oceny manualnej.</i>"
+                    )
+                    await send_tg_topic(msg)
+                    logger.info(f"Wykryto manualny setup {direction} dla {symbol} (RR: {rr_ratio:.2f} - ignorowany przez AI)")
 
         except Exception as e:
-            logger.error(f"Error {symbol}: {e}", exc_info=True)
+            logger.error(f"Error {symbol}: {e}")
 
 if __name__ == "__main__":
     asyncio.run(scan_market())

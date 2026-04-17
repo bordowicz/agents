@@ -38,5 +38,9 @@
   "maturation": {
     "required_signals": 2,
     "lookback_minutes": 120
+  },
+  "risk_management": {
+    "min_rr_ratio": 2.0,
+    "manual_alert_rr_ratio": 1.5
   }
 }

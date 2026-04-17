@@ -3,8 +3,9 @@ import json
 import yfinance as yf
 import pandas as pd
 import pandas_ta as ta
+import numpy as np
 from sqlalchemy import create_engine, text
-import telegram
+import requests
 import asyncio
 import logging
 from datetime import datetime, timezone
@@ -17,7 +18,8 @@ logger = logging.getLogger("Stocks_Agent_1")
 # Zmienne środowiskowe
 DB_URL: str = os.getenv("DATABASE_URL", "")
 TG_TOKEN: str = os.getenv("TELEGRAM_SIGNAL_TOKEN", "")
-CHAT_ID: str = os.getenv("CHAT_ID", "")
+CHAT_ID: str = os.getenv("GROUP_CHAT_ID", "")
+SCANNER_THREAD_ID: str = os.getenv("SCANNER_THREAD_STOCKS_ID", "9")
 
 engine = create_engine(DB_URL)
 BASE_DIR: str = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -31,83 +33,81 @@ def load_config() -> dict:
         logger.error(f"Nie znaleziono pliku konfiguracyjnego w {CONFIG_PATH}")
         exit(1)
 
-async def send_tg(message: str) -> None:
-    if not TG_TOKEN or not CHAT_ID:
-        logger.warning("Brak konfiguracji Telegram.")
-        return
+def safe_float(val):
+    """Konwertuje wartość na float, zamieniając NaN/Inf na 0.0."""
     try:
-        bot = telegram.Bot(token=TG_TOKEN)
-        await bot.send_message(chat_id=CHAT_ID, text=message, parse_mode='HTML') # Zmiana na HTML dla lepszej czytelności
+        if val is None or np.isnan(val) or np.isinf(val):
+            return 0.0
+        return float(val)
+    except:
+        return 0.0
+
+async def send_tg_topic(message: str) -> None:
+    if not TG_TOKEN or not CHAT_ID: return
+    url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": CHAT_ID,
+        "text": message,
+        "parse_mode": "HTML"
+    }
+    if SCANNER_THREAD_ID:
+        payload["message_thread_id"] = int(SCANNER_THREAD_ID)
+
+    try:
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, lambda: requests.post(url, json=payload, timeout=10))
     except Exception as e:
-        logger.error(f"Błąd Telegram: {e}")
+        logger.error(f"Telegram Error: {e}")
 
 def is_market_open(last_candle_time: datetime) -> bool:
-    """
-    Zabezpieczenie: Sprawdza, czy ostatnia świeca nie jest starsza niż 2 godziny.
-    Zapobiega generowaniu sygnałów w weekendy lub po zamknięciu sesji.
-    """
     now = datetime.now(timezone.utc)
-    # yfinance zwraca timezone-aware datetime
     diff = now - last_candle_time
-    return diff.total_seconds() < 7200 # 2 godziny
+    return diff.total_seconds() < 86400
 
 def calculate_indicators(df: pd.DataFrame, config: dict) -> pd.DataFrame:
     ind_cfg = config['indicators']
-
-    # yfinance używa wielkich liter dla kolumn
     df['rsi'] = ta.rsi(df['Close'], length=ind_cfg['rsi_period'])
     df['atr'] = ta.atr(df['High'], df['Low'], df['Close'], length=ind_cfg['atr_period'])
     df['ema_fast'] = ta.ema(df['Close'], length=ind_cfg['ema_fast'])
     df['ema_slow'] = ta.ema(df['Close'], length=ind_cfg['ema_slow'])
 
-    # MACD
     macd = ta.macd(df['Close'], fast=ind_cfg['macd_fast'], slow=ind_cfg['macd_slow'], signal=ind_cfg['macd_signal'])
     if macd is not None and not macd.empty:
         df['macd'] = macd.iloc[:, 0]
         df['macdh'] = macd.iloc[:, 1]
         df['macds'] = macd.iloc[:, 2]
     else:
-        df['macd'] = pd.NA
-        df['macdh'] = pd.NA
-        df['macds'] = pd.NA
+        df['macd'] = 0.0; df['macdh'] = 0.0; df['macds'] = 0.0
 
-    # ADX
     adx = ta.adx(df['High'], df['Low'], df['Close'], length=ind_cfg['adx_period'])
     if adx is not None and not adx.empty:
-        df['adx'] = adx.iloc[:, 0]
-        df['dmp'] = adx.iloc[:, 1]
-        df['dmn'] = adx.iloc[:, 2]
+        df['adx'] = adx.iloc[:, 0]; df['dmp'] = adx.iloc[:, 1]; df['dmn'] = adx.iloc[:, 2]
     else:
-        df['adx'] = pd.NA
-        df['dmp'] = pd.NA
-        df['dmn'] = pd.NA
+        df['adx'] = 0.0; df['dmp'] = 0.0; df['dmn'] = 0.0
 
-    # Stochastic
     stoch = ta.stoch(df['High'], df['Low'], df['Close'], k=ind_cfg['stoch_k'], d=ind_cfg['stoch_d'])
     if stoch is not None and not stoch.empty:
-        df['stoch_k'] = stoch.iloc[:, 0]
-        df['stoch_d'] = stoch.iloc[:, 1]
+        df['stoch_k'] = stoch.iloc[:, 0]; df['stoch_d'] = stoch.iloc[:, 1]
     else:
-        df['stoch_k'] = pd.NA
-        df['stoch_d'] = pd.NA
+        df['stoch_k'] = 0.0; df['stoch_d'] = 0.0
 
-    # VWAP (Volume Weighted Average Price) - Kluczowe dla akcji!
     try:
-        df['vwap'] = ta.vwap(high=df['High'], low=df['Low'], close=df['Close'], volume=df['Volume'])
+        vwap_val = ta.vwap(high=df['High'], low=df['Low'], close=df['Close'], volume=df['Volume'])
+        df['vwap'] = vwap_val if vwap_val is not None else df['Close']
     except Exception:
-        df['vwap'] = df['Close'] # Fallback jeśli brakuje danych do VWAP
+        df['vwap'] = df['Close']
 
-    # VSA / Big Guy
+    df['swing_high'] = df['High'].rolling(window=ind_cfg['swing_lookback']).max()
+    df['swing_low'] = df['Low'].rolling(window=ind_cfg['swing_lookback']).min()
+    df['hybrid_sl_long'] = df[['swing_low', 'vwap']].min(axis=1) - (0.5 * df['atr'].fillna(0))
+    df['hybrid_tp_long'] = df['swing_high'] - (0.2 * df['atr'].fillna(0))
+    df['hybrid_sl_short'] = df[['swing_high', 'vwap']].max(axis=1) + (0.5 * df['atr'].fillna(0))
+    df['hybrid_tp_short'] = df['swing_low'] + (0.2 * df['atr'].fillna(0))
+
     avg_vol = df['Volume'].rolling(window=20).mean()
-    vol_spike = df['Volume'] > (avg_vol * ind_cfg['vsa_volume_multiplier'])
-    spread = df['High'] - df['Low']
-    avg_spread = spread.rolling(window=20).mean()
-    narrow_spread = spread < avg_spread
-    df['is_big_guy'] = vol_spike & narrow_spread
-
-    # Dodatkowe: RSI Trend (nachylenie z ostatnich 3 świec)
+    df['is_big_guy'] = (df['Volume'] > (avg_vol * ind_cfg['vsa_volume_multiplier'])) & \
+                       ((df['High'] - df['Low']) < (df['High'] - df['Low']).rolling(window=20).mean())
     df['rsi_slope'] = df['rsi'].diff(3)
-
     return df
 
 async def scan_market() -> None:
@@ -117,139 +117,150 @@ async def scan_market() -> None:
     ind_cfg: dict = config['indicators']
     tickers: list[str] = scan_cfg['active_tickers']
 
-    logger.info(f"Rozpoczynam skanowanie {len(tickers)} akcji (Interwał: {scan_cfg['timeframe']})...")
+    logger.info(f"Skanowanie {len(tickers)} akcji...")
 
     for symbol in tickers:
         try:
-            # Pobieranie danych z yfinance
             ticker_obj = yf.Ticker(symbol)
             df = ticker_obj.history(interval=scan_cfg['timeframe'], period="1mo")
 
-            max_lookback = max(
-                ind_cfg['rsi_period'], ind_cfg['atr_period'], ind_cfg['ema_slow'],
-                ind_cfg['macd_slow'] + ind_cfg['macd_signal'], ind_cfg['adx_period'],
-                ind_cfg['stoch_k'] + ind_cfg['stoch_d']
-            )
+            if df.empty or len(df) < 50: continue
+            if not is_market_open(df.index[-1]): continue
 
-            if df.empty or len(df) < max_lookback + 10:
-                logger.warning(f"Niewystarczająca ilość danych dla {symbol}. Dostępne: {len(df)}")
-                continue
-
-            # Weryfikacja czy giełda w ogóle działa dla tego waloru
-            last_candle_time = df.index[-1]
-            if not is_market_open(last_candle_time):
-                continue # Pomijamy, giełda zamknięta
-
-            # Obliczenia wskaźników
             df = calculate_indicators(df, config)
             last_row = df.iloc[-1]
 
-            if pd.isna(last_row['rsi']) or pd.isna(last_row['atr']) or pd.isna(last_row['macd']) or pd.isna(last_row['adx']):
-                continue
+            if pd.isna(last_row['rsi']): continue
 
-            # Precision using Decimal
-            current_price: Decimal = Decimal(str(last_row['Close']))
-            current_volume: Decimal = Decimal(str(last_row['Volume']))
+            current_price = Decimal(str(last_row['Close']))
+            current_volume = Decimal(str(last_row['Volume']))
 
+            # Bezpieczna budowa JSON
             indicators_json = {
-                "rsi": round(float(last_row['rsi']), 2),
-                "atr": float(last_row['atr']),
-                "vwap": float(last_row['vwap']),
-                "ema_fast": float(last_row['ema_fast']),
-                "ema_slow": float(last_row['ema_slow']),
-                "macd": float(last_row['macd']),
-                "macdh": float(last_row['macdh']),
-                "macds": float(last_row['macds']),
-                "adx": float(last_row['adx']),
-                "dmp": float(last_row['dmp']),
-                "dmn": float(last_row['dmn']),
-                "stoch_k": float(last_row['stoch_k']),
-                "stoch_d": float(last_row['stoch_d']),
+                "rsi": safe_float(last_row['rsi']),
+                "atr": safe_float(last_row['atr']),
+                "vwap": safe_float(last_row['vwap']),
+                "ema_fast": safe_float(last_row['ema_fast']),
+                "ema_slow": safe_float(last_row['ema_slow']),
+                "macd": safe_float(last_row['macd']),
+                "macdh": safe_float(last_row['macdh']),
+                "macds": safe_float(last_row['macds']),
+                "adx": safe_float(last_row['adx']),
+                "dmp": safe_float(last_row['dmp']),
+                "dmn": safe_float(last_row['dmn']),
+                "stoch_k": safe_float(last_row['stoch_k']),
+                "stoch_d": safe_float(last_row['stoch_d']),
                 "vsa_signal": bool(last_row['is_big_guy']),
-                "rsi_slope": float(last_row['rsi_slope']) if not pd.isna(last_row['rsi_slope']) else 0.0
+                "rsi_slope": safe_float(last_row['rsi_slope']),
+                "sl_hybrid_long": safe_float(last_row['hybrid_sl_long']),
+                "tp_hybrid_long": safe_float(last_row['hybrid_tp_long']),
+                "sl_hybrid_short": safe_float(last_row['hybrid_sl_short']),
+                "tp_hybrid_short": safe_float(last_row['hybrid_tp_short'])
             }
 
-            # Zapis do bazy
             with engine.connect() as conn:
                 query = text("""
                     INSERT INTO price_history (time, symbol, market_type, price, volume, indicators)
                     VALUES (NOW(), :sym, 'stocks', :pr, :vol, :ind)
                 """)
-                conn.execute(query, {
-                    "sym": symbol,
-                    "pr": current_price,
-                    "vol": current_volume,
-                    "ind": json.dumps(indicators_json)
-                })
+                conn.execute(query, {"sym": symbol, "pr": current_price, "vol": current_volume, "ind": json.dumps(indicators_json)})
                 conn.commit()
 
-            # Logika Dojrzewania
             with engine.connect() as conn:
                 check_query = text(f"""
                     SELECT count(*) FROM price_history
-                    WHERE symbol = :sym
-                    AND market_type = 'stocks'
+                    WHERE symbol = :sym AND market_type = 'stocks'
                     AND (indicators->>'vsa_signal')::boolean = true
                     AND time > NOW() - INTERVAL '{mat_cfg['lookback_minutes']} minutes'
                 """)
-
                 vsa_count: int = conn.scalar(check_query, {"sym": symbol})
 
-                recent_candles = df.tail(3)
-                price_above_vwap: bool = (recent_candles['Close'] >= recent_candles['vwap']).all()
-                price_below_vwap: bool = (recent_candles['Close'] <= recent_candles['vwap']).all()
+                recent = df.tail(3)
+                price_above_vwap = (recent['Close'] >= recent['vwap']).all()
+                price_below_vwap = (recent['Close'] <= recent['vwap']).all()
 
-                # --- LOGIKA LONG ---
-                long_bullish_ema: bool = float(last_row['ema_fast']) > float(last_row['ema_slow'])
-                long_macd_bullish: bool = last_row['macd'] > last_row['macds'] and last_row['macdh'] > 0
-                long_adx_strong: bool = last_row['adx'] > ind_cfg['adx_threshold'] and last_row['dmp'] > last_row['dmn']
-                long_rsi_healthy: bool = last_row['rsi'] > 45 and last_row['rsi_slope'] >= -1.0
-                long_stoch_not_overbought: bool = last_row['stoch_k'] < 80
-
-                # --- LOGIKA SHORT ---
-                short_bearish_ema: bool = float(last_row['ema_fast']) < float(last_row['ema_slow'])
-                short_macd_bearish: bool = last_row['macd'] < last_row['macds'] and last_row['macdh'] < 0
-                short_adx_strong: bool = last_row['adx'] > ind_cfg['adx_threshold'] and last_row['dmn'] > last_row['dmp']
-                short_rsi_weak: bool = last_row['rsi'] < 55 and last_row['rsi_slope'] <= 1.0
-                short_stoch_not_oversold: bool = last_row['stoch_k'] > 20
-
+                # --- NOWOŚĆ: Obliczanie RR i segregacja alertów ---
                 setup_detected = False
+                manual_alert = False
                 direction = ""
-                reasoning = ""
+                sl_val, tp_val, rr_ratio = 0.0, 0.0, 0.0
 
                 if vsa_count >= mat_cfg['required_signals']:
-                    if (price_above_vwap and long_bullish_ema and long_macd_bullish and
-                        long_adx_strong and long_rsi_healthy and long_stoch_not_overbought):
-                        setup_detected = True
+                    curr_price_f = safe_float(last_row['Close'])
+
+                    # WERYFIKACJA LONG
+                    if price_above_vwap and safe_float(last_row['ema_fast']) > safe_float(last_row['ema_slow']):
                         direction = "LONG"
-                        reasoning = "Wzrostowy (Cena nad VWAP, Trend Bullish, Stochastic nie wykupiony)"
-                    elif (price_below_vwap and short_bearish_ema and short_macd_bearish and
-                          short_adx_strong and short_rsi_weak and short_stoch_not_oversold):
-                        setup_detected = True
+                        sl_val = safe_float(last_row['hybrid_sl_long'])
+                        tp_val = safe_float(last_row['hybrid_tp_long'])
+                        risk = curr_price_f - sl_val
+                        reward = tp_val - curr_price_f
+                        rr_ratio = reward / risk if risk > 0 else 0
+
+                        risk_cfg: dict = config.get('risk_management', {'min_rr_ratio': 2.0, 'manual_alert_rr_ratio': 1.5})
+                        MIN_RR = risk_cfg['min_rr_ratio']
+                        MANUAL_RR = risk_cfg['manual_alert_rr_ratio']
+
+                        if rr_ratio >= MIN_RR:
+                            setup_detected = True
+                        elif rr_ratio >= MANUAL_RR:
+                            manual_alert = True
+
+                    # WERYFIKACJA SHORT
+                    elif price_below_vwap and safe_float(last_row['ema_fast']) < safe_float(last_row['ema_slow']):
                         direction = "SHORT"
-                        reasoning = "Spadkowy (Cena pod VWAP, Trend Bearish, Stochastic nie wyprzedany)"
+                        sl_val = safe_float(last_row['hybrid_sl_short'])
+                        tp_val = safe_float(last_row['hybrid_tp_short'])
+                        risk = sl_val - curr_price_f
+                        reward = curr_price_f - tp_val
+                        rr_ratio = reward / risk if risk > 0 else 0
 
+                        risk_cfg: dict = config.get('risk_management', {'min_rr_ratio': 2.0, 'manual_alert_rr_ratio': 1.5})
+                        MIN_RR = risk_cfg['min_rr_ratio']
+                        MANUAL_RR = risk_cfg['manual_alert_rr_ratio']
+
+                        if rr_ratio >= MIN_RR:
+                            setup_detected = True
+                        elif rr_ratio >= MANUAL_RR:
+                            manual_alert = True
+
+                # SCIEŻKA 1: Setup dla AI (RR >= 2.0)
                 if setup_detected:
-                    direction_icon = "📈" if direction == "LONG" else "📉"
-                    direction_text = "WZROST" if direction == "LONG" else "SPADEK"
-
+                    icon = "📈" if direction == "LONG" else "📉"
                     msg = (
-                        f"{direction_icon} <b>POTENCJALNY {direction_text} (Setup {direction}): {symbol}</b>\n\n"
-                        f"🚀 <b>Dlaczego?</b>\n"
-                        f"• Trend: <u>{reasoning}</u>\n"
-                        f"• Aktywność Dużych Graczy (VSA): Tak ({vsa_count}x)\n"
-                        f"• Siła Trendu (ADX): {float(last_row['adx']):.1f} (Silny)\n\n"
-                        f"📊 <b>Dane techniczne:</b>\n"
-                        f"• Cena: <code>{current_price:.2f}</code>\n"
-                        f"• RSI: <code>{float(last_row['rsi']):.1f}</code>\n"
-                        f"• Stochastic: <code>{float(last_row['stoch_k']):.1f}</code>\n\n"
-                        f"⏳ <i>Przekazuję dane do eksperta AI w celu wyznaczenia SL/TP...</i>"
+                        f"{icon} <b>DETEKCJA SETUPU (STOCKS): {symbol}</b>\n\n"
+                        f"🚀 <b>Typ:</b> {direction}\n"
+                        f"• VSA Signals: {vsa_count}x\n\n"
+                        f"📊 <b>Dane:</b>\n"
+                        f"• Cena: <code>{safe_float(last_row['Close']):.2f}</code>\n"
+                        f"• RSI: <code>{safe_float(last_row['rsi']):.1f}</code>\n"
+                        f"• Hybrydowy SL: <code>{sl_val:.2f}</code>\n"
+                        f"• Hybrydowy TP: <code>{tp_val:.2f}</code>\n"
+                        f"⚖️ <b>Risk/Reward:</b> <code>1:{rr_ratio:.2f}</code>\n\n"
+                        f"⏳ <i>Przekazuję dane do analizy AI...</i>"
                     )
-                    await send_tg(msg)
-                    logger.info(f"Wykryto setup {direction} dla {symbol}")
+                    await send_tg_topic(msg)
+                    logger.info(f"Wykryto setup {direction} dla {symbol} (RR: {rr_ratio:.2f})")
+
+                # SCIEŻKA 2: Setup manualny (1.5 <= RR < 2.0)
+                elif manual_alert:
+                    icon = "👀"
+                    msg = (
+                        f"{icon} <b>OBSERWACJA RĘCZNA (STOCKS): {symbol}</b>\n\n"
+                        f"🚀 <b>Typ:</b> {direction}\n"
+                        f"• VSA Signals: {vsa_count}x\n\n"
+                        f"📊 <b>Dane:</b>\n"
+                        f"• Cena: <code>{safe_float(last_row['Close']):.2f}</code>\n"
+                        f"• Hybrydowy SL: <code>{sl_val:.2f}</code>\n"
+                        f"• Hybrydowy TP: <code>{tp_val:.2f}</code>\n"
+                        f"⚖️ <b>Risk/Reward:</b> <code>1:{rr_ratio:.2f}</code>\n\n"
+                        f"⛔ <i>RR zbyt niskie dla AI. Trade do oceny manualnej.</i>"
+                    )
+                    await send_tg_topic(msg)
+                    logger.info(f"Wykryto manualny setup {direction} dla {symbol} (RR: {rr_ratio:.2f} - odrzucony przez twardy filtr)")
 
         except Exception as e:
-            logger.error(f"Błąd przetwarzania akcji {symbol}: {e}", exc_info=True)
+            logger.error(f"Błąd {symbol}: {e}")
 
 if __name__ == "__main__":
     asyncio.run(scan_market())

@@ -1,26 +1,33 @@
 import os
 import json
 import pandas as pd
-from sqlalchemy import create_engine, text
 import asyncio
 import logging
 import requests
 import html
-from anthropic import Anthropic
+import warnings
+from datetime import datetime
+
+# Całkowite wyciszenie ostrzeżeń
+warnings.filterwarnings("ignore", category=FutureWarning)
+os.environ["PYTHONWARNINGS"] = "ignore"
+
+import google.generativeai as genai
+from google.api_core import exceptions
+from sqlalchemy import create_engine, text
 
 # Konfiguracja Logów
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
-logger = logging.getLogger("AI_Analyst_Agent_Pro")
+logger = logging.getLogger("Gemini_Analyst_Agent_Pro")
 
 # ENV
 DB_URL: str = os.getenv("DATABASE_URL", "")
 TG_TOKEN: str = os.getenv("TELEGRAM_SIGNAL_TOKEN", "")
 CHAT_ID: str = os.getenv("GROUP_CHAT_ID", "")
-THREAD_ID: str = os.getenv("CLAUDE_THREAD_ID", "")
-ANTHROPIC_KEY: str = os.getenv("ANTHROPIC_API_KEY", "")
+THREAD_ID: str = os.getenv("GEMINI_THREAD_ID", "5")
+GEMINI_KEY: str = os.getenv("GEMINI_API_KEY", "")
 
 engine = create_engine(DB_URL)
-client = Anthropic(api_key=ANTHROPIC_KEY)
 
 BASE_DIR: str = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -50,18 +57,50 @@ def calculate_potential_rr(entry, sl, tp, direction):
     except Exception:
         return 0
 
+def initialize_gemini():
+    """Dynamicznie znajduje dostępny model flash lub fallbackuje do gemini-pro."""
+    if not GEMINI_KEY:
+        logger.error("Brak klucza GEMINI_API_KEY!")
+        return None
+    genai.configure(api_key=GEMINI_KEY)
+    try:
+        all_models = genai.list_models()
+        available_for_content_generation = [
+            m for m in all_models if 'generateContent' in m.supported_generation_methods
+        ]
+
+        flash_model_name = None
+        for version in ['2.5', '2.0', '1.5', 'flash']:
+            for m in available_for_content_generation:
+                if version in m.name:
+                    flash_model_name = m.name
+                    break
+            if flash_model_name: break
+
+        if flash_model_name:
+            logger.info(f"🚀 Inicjalizacja Gemini: {flash_model_name}")
+            return genai.GenerativeModel(flash_model_name)
+        else:
+            if any('pro' in m.name for m in available_for_content_generation):
+                logger.warning("Brak flash, używam gemini-pro")
+                return genai.GenerativeModel('gemini-pro')
+            return None
+
+    except Exception as e:
+        logger.error(f"Błąd inicjalizacji Gemini: {e}")
+        return None
+
+model = initialize_gemini()
+
 async def send_tg_topic(message: str) -> None:
-    """Wysyła wiadomość do konkretnego topicu w grupie Telegram."""
     if not TG_TOKEN or not CHAT_ID: return
     url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
     payload = {
         "chat_id": CHAT_ID,
         "text": message,
-        "parse_mode": "HTML"
+        "parse_mode": "HTML",
+        "message_thread_id": int(THREAD_ID)
     }
-    if THREAD_ID:
-        payload["message_thread_id"] = int(THREAD_ID)
-
     try:
         loop = asyncio.get_event_loop()
         await loop.run_in_executor(None, lambda: requests.post(url, json=payload, timeout=10))
@@ -69,7 +108,6 @@ async def send_tg_topic(message: str) -> None:
         logger.error(f"Telegram Error: {e}")
 
 def get_pending_setups():
-    """Znajduje symbole z ostatnimi setupami do analizy."""
     query = text("""
         WITH RecentSetups AS (
             SELECT symbol, MAX(time) as setup_time, market_type
@@ -80,7 +118,7 @@ def get_pending_setups():
         )
         SELECT r.symbol, r.market_type
         FROM RecentSetups r
-        LEFT JOIN signals s ON r.symbol = s.symbol AND s.created_at > NOW() - INTERVAL '4 hours'
+        LEFT JOIN signals_gemini s ON r.symbol = s.symbol AND s.created_at > NOW() - INTERVAL '4 hours'
         WHERE s.id IS NULL;
     """)
     with engine.connect() as conn:
@@ -99,70 +137,62 @@ def get_market_context(symbol: str) -> pd.DataFrame:
     df = df.sort_values(by='time')
     return df
 
-# --- ZMIANA: Funkcja przyjmuje teraz zmienną min_rr ---
-def ask_claude_for_setup(symbol: str, df_context: pd.DataFrame, min_rr: float) -> dict | None:
-    # Wyciągamy dane z ostatniej świecy (hybrydowe sugestie od Agenta 1)
-    last_row = df_context.iloc[-1]
-    indicators = last_row['indicators']
-    if isinstance(indicators, str): indicators = json.loads(indicators)
+# --- ZMIANA: Funkcja przyjmuje teraz min_rr ---
+async def ask_gemini_with_backoff(symbol: str, df_context: pd.DataFrame, direction: str, sl: float, tp: float, min_rr: float) -> dict | None:
+    if not model: return None
 
-    # Przygotowanie kontekstu dla Claude
+    last_row = df_context.iloc[-1]
+
     context_str = ""
     for _, row in df_context.iterrows():
         ind = row['indicators']
         if isinstance(ind, str): ind = json.loads(ind)
         context_str += (
             f"T: {row['time']}, P: {row['price']}, V: {row['volume']}, "
-            f"VWAP: {ind.get('vwap', 0):.4f}, RSI: {ind.get('rsi', 0):.1f}, "
-            f"ATR: {ind.get('atr', 0):.4f}\n"
+            f"VWAP: {ind.get('vwap', 0):.4f}, RSI: {ind.get('rsi', 0):.1f}\n"
         )
 
     # --- ZMIANA: Dynamiczny prompt z wartością min_rr ---
-    system_prompt = f"""You are an elite Quant Trader/a Senior Hedge Fund Analyst. Analyze 30 periods of data for {symbol}.
-    STRICT RULE: Only approve trades with a mathematical Risk/Reward Ratio of 1:{min_rr} or higher.
+    prompt = f"""You are an elite Quant Trader/Senior Hedge Fund Analyst. Analyze 30 periods for {symbol}.
+    STRICT RULE: Only approve trades with high technical conviction. Math check has been done: RR is {min_rr}+.
 
-    CRITERIA FOR LONG: Price consistently above/bouncing off VWAP, EMA Fast > Slow, MACD bullish, RSI > 45.
-    CRITERIA FOR SHORT: Price consistently below VWAP, EMA Fast < Slow, MACD bearish, RSI < 55.
+    CRITERIA:
+    LONG: Price above VWAP, EMA Fast > Slow, MACD bullish.
+    SHORT: Price below VWAP, EMA Fast < Slow, MACD bearish.
 
-    HYBRID LEVELS (Calculated by Scout):
-    - Suggested LONG: SL {indicators.get('sl_hybrid_long')}, TP {indicators.get('tp_hybrid_long')}
-    - Suggested SHORT: SL {indicators.get('sl_hybrid_short')}, TP {indicators.get('tp_hybrid_short')}
-    - Swing High/Low (50p): {indicators.get('swing_h')} / {indicators.get('swing_l')}
-
-    TASK: Validate the setup. If RR < {min_rr} or context is weak, REJECT.
-    You MUST respond ONLY with a raw JSON object:
+    TASK: Validate the setup. If trend alignment is weak, REJECT.
+    Return ONLY a raw JSON object:
     {{
       "status": "APPROVED" | "REJECTED",
-      "direction": "LONG" | "SHORT",
+      "direction": "{direction}",
       "entry": {float(last_row['price'])},
-      "sl": float,
-      "tp": float,
-      "reasoning": "string (max 2 sentences, must mention RR ratio and VSA)"
+      "sl": {sl},
+      "tp": {tp},
+      "reasoning": "string"
     }}"""
 
-    user_prompt = f"Analyze {symbol} data:\n\n{context_str}"
+    for i in range(3):
+        try:
+            response = await asyncio.to_thread(model.generate_content, prompt + "\nData:\n" + context_str)
+            result_text = response.text.strip()
+            if "```json" in result_text:
+                result_text = result_text.split("```json")[1].split("```")[0].strip()
 
-    try:
-        response = client.messages.create(
-            model="claude-sonnet-4-6", # Pamiętaj o aktualizacji modelu, jeśli API wyrzuci błąd!
-            max_tokens=500,
-            temperature=0.1,
-            system=system_prompt,
-            messages=[{"role": "user", "content": user_prompt}]
-        )
-        result_text = response.content[0].text.strip()
-        # Czyszczenie markdown jeśli Claude go doda
-        if "```json" in result_text:
-            result_text = result_text.split("```json")[1].split("```")[0].strip()
-        return json.loads(result_text)
-    except Exception as e:
-        logger.error(f"Błąd API Claude dla {symbol}: {e}")
-        return None
+            result_text = result_text.replace("`", "").replace("json", "").strip()
+            return json.loads(result_text)
+        except exceptions.ResourceExhausted:
+            await asyncio.sleep(10 * (i + 1))
+        except Exception as e:
+            logger.error(f"Gemini error for {symbol}: {e}")
+            await asyncio.sleep(2)
+    return None
 
 async def main():
-    if not ANTHROPIC_KEY: return
+    if not model: return
     setups = get_pending_setups()
     if not setups: return
+
+    logger.info(f"Gemini analizuje {len(setups)} nowych setupów...")
 
     for symbol, m_type in setups:
         df_context = get_market_context(symbol)
@@ -172,7 +202,6 @@ async def main():
         config = load_market_config(m_type)
         min_rr = config.get('risk_management', {}).get('min_rr_ratio', 2.0)
 
-        # Twardy filtr RR (Oszczędność tokenów)
         last_row = df_context.iloc[-1]
         indicators = last_row['indicators']
         if isinstance(indicators, str): indicators = json.loads(indicators)
@@ -189,13 +218,13 @@ async def main():
 
         rr_ratio = calculate_potential_rr(price, sl_val, tp_val, direction)
 
-        # --- ZMIANA: Porównujemy z wartością min_rr zamiast twardego 2.0 ---
+        # --- ZMIANA: Porównanie z dynamicznym min_rr ---
         if rr_ratio < min_rr:
-            logger.info(f"Odrzucenie automatyczne (RR {rr_ratio:.2f} < wymagane {min_rr}) dla {symbol} - oszczędność API.")
+            logger.info(f"Odrzucenie automatyczne (RR {rr_ratio:.2f} < wymagane {min_rr}) dla {symbol} - oszczędność API Gemini.")
             with engine.connect() as conn:
                 query = text("""
-                    INSERT INTO signals (symbol, entry_price, sl, tp, ai_verdict, status, direction, market_type)
-                    VALUES (:sym, :en, :sl, :tp, :verdict, :status, :dir, :mt)
+                    INSERT INTO signals_gemini (symbol, entry_price, sl, tp, ai_verdict, status, direction, market_type, created_at)
+                    VALUES (:sym, :en, :sl, :tp, :verdict, :status, :dir, :mt, NOW())
                 """)
                 conn.execute(query, {
                     "sym": symbol, "en": price, "sl": sl_val, "tp": tp_val,
@@ -203,57 +232,49 @@ async def main():
                     "status": "REJECTED", "dir": direction, "mt": m_type
                 })
                 conn.commit()
-            continue # Przechodzi do następnego symbolu bez wywoływania Claude
+            continue # Przejdź dalej bez zapytania do API
         # --------------------------------------------------------
 
-        logger.info(f"RR poprawne ({rr_ratio:.2f} >= {min_rr}). Analizuję {symbol} przez Claude AI...")
+        logger.info(f"RR poprawne ({rr_ratio:.2f} >= {min_rr}). Pytam Gemini o {symbol}...")
 
         # Przekazujemy zmienną min_rr do funkcji AI
-        ai_verdict = ask_claude_for_setup(symbol, df_context, min_rr)
+        ai_verdict = await ask_gemini_with_backoff(symbol, df_context, direction, sl_val, tp_val, min_rr)
 
         if not ai_verdict: continue
 
-        # Zapis do bazy
+        # Zapis do tabeli signals_gemini
         with engine.connect() as conn:
             query = text("""
-                INSERT INTO signals (symbol, entry_price, sl, tp, ai_verdict, status, direction, market_type)
-                VALUES (:sym, :en, :sl, :tp, :verdict, :status, :dir, :mt)
+                INSERT INTO signals_gemini (symbol, entry_price, sl, tp, ai_verdict, status, direction, market_type, created_at)
+                VALUES (:sym, :en, :sl, :tp, :verdict, :status, :dir, :mt, NOW())
             """)
             conn.execute(query, {
-                "sym": symbol, "en": ai_verdict.get('entry', 0.0),
-                "sl": ai_verdict.get('sl', 0.0), "tp": ai_verdict.get('tp', 0.0),
+                "sym": symbol, "en": ai_verdict.get('entry', price),
+                "sl": ai_verdict.get('sl', sl_val), "tp": ai_verdict.get('tp', tp_val),
                 "verdict": ai_verdict.get('reasoning', ''),
                 "status": "OPEN" if ai_verdict.get('status') == 'APPROVED' else "REJECTED",
-                "dir": ai_verdict.get('direction', 'LONG'),
+                "dir": ai_verdict.get('direction', direction),
                 "mt": m_type
             })
             conn.commit()
 
-        # Powiadomienie Telegram tylko dla zatwierdzonych
         if ai_verdict.get('status') == 'APPROVED':
             dir_icon = "🚀" if ai_verdict['direction'] == "LONG" else "📉"
             dir_text = "WZROST (LONG)" if ai_verdict['direction'] == "LONG" else "SPADEK (SHORT)"
 
-            # Obliczanie RR dla wiadomości
-            risk = abs(ai_verdict['entry'] - ai_verdict['sl'])
-            reward = abs(ai_verdict['tp'] - ai_verdict['entry'])
-            rr_val = round(reward/risk, 2) if risk > 0 else 0
-
             escaped_reasoning = html.escape(ai_verdict['reasoning'])
-
             msg = (
-                f"🧠 <b>CLAUDE AI PRO ZATWIERDZA: {symbol}</b>\n\n"
+                f"♊ <b>GEMINI PRO ANALYST: {symbol}</b>\n\n"
                 f"🎯 <b>Kierunek:</b> <u>{dir_text}</u> {dir_icon}\n"
                 f"💰 <b>Wejście:</b> <code>{ai_verdict['entry']}</code>\n"
                 f"🛑 <b>Stop Loss:</b> <code>{ai_verdict['sl']}</code>\n"
                 f"✅ <b>Take Profit:</b> <code>{ai_verdict['tp']}</code>\n"
-                f"📊 <b>Risk/Reward:</b> <code>1:{rr_val}</code> <i>(Min: {min_rr})</i>\n\n"
+                f"📊 <b>Risk/Reward:</b> <code>1:{rr_ratio:.2f}</code> <i>(Min: {min_rr})</i>\n\n"
                 f"📝 <b>Analiza:</b>\n<i>{escaped_reasoning}</i>"
             )
             await send_tg_topic(msg)
-            logger.info(f"Signal APPROVED for {symbol}")
-        else:
-            logger.info(f"Signal REJECTED for {symbol}: {ai_verdict.get('reasoning')}")
+            logger.info(f"Gemini APPROVED {symbol} (RR: 1:{rr_ratio:.2f})")
+            await asyncio.sleep(2) # Anty-spam
 
 if __name__ == "__main__":
     asyncio.run(main())

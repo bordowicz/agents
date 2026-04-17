@@ -1,4 +1,3 @@
-# Zmieniamy bazę na 3.12-slim, aby spełnić wymagania pandas-ta
 FROM python:3.12-slim
 
 # 1. Instalacja zależności systemowych
@@ -14,7 +13,7 @@ WORKDIR /app
 # 2. Aktualizacja narzędzi instalacyjnych
 RUN pip install --no-cache-dir --upgrade pip setuptools wheel
 
-# 3. Instalacja bibliotek (pandas zostawiamy w wersji < 3.0.0 dla stabilności pandas-ta)
+# 3. Instalacja bibliotek
 RUN pip install --no-cache-dir \
     "pandas<3.0.0" \
     ccxt \
@@ -22,9 +21,11 @@ RUN pip install --no-cache-dir \
     sqlalchemy \
     psycopg2-binary \
     python-telegram-bot \
-    anthropic
+    anthropic \
+    "google-generativeai>=0.8.3" \
+    requests
 
-# 4. Instalacja pandas-ta - teraz Python 3.12 pozwoli na instalację najnowszych wersji
+# 4. Instalacja pandas-ta
 RUN pip install --no-cache-dir pandas-ta
 
 CMD ["tail", "-f", "/dev/null"]
